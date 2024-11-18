@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import os
+import json
+import numpy as np
+import math
+from math import pi
+import random
+import time
+import csv
+import pandas as pd
+import matplotlib.pyplot as plt
+import sys
+import bezier
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+from collections import deque
+from std_msgs.msg import Float32MultiArray,Float32,UInt8
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import Twist, Point, Pose, PoseStamped
+from std_srvs.srv import Empty
+from nav_msgs.msg import Odometry
+from gazebo_msgs.msg import ModelState,ModelStates
+from gazebo_msgs.srv import SetModelState
+from datetime import datetime
+#強化学習ライブラリ
+import pfrl
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from pfrl import experiments, replay_buffers, utils
+from pfrl.agents import PPO
+
+# from respawnGoal import Respawn
+
+sys.path.append('/home/pbl-go1/unitree_go1_ws/src/unitree_ros/unitree_ros_to_real/unitree_legged_sdk/lib/python/amd64')
+import robot_interface as sdk
+
+class PPOModel(nn.Module):
+    def __init__(self, obs_size, n_actions):
+        super(PPOModel, self).__init__()
+
+        self.policy = nn.Sequential(
+            nn.Linear(obs_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, n_actions),
+            pfrl.policies.GaussianHeadWithStateIndependentCovariance(
+                action_size=n_actions,
+                var_type="diagonal",
+                var_func=lambda x: torch.exp(2 * x),  # Parameterize log std
+                var_param_init=0,  # log std = 0 => std = 1
+            ),
+        )
+
+        self.value = nn.Sequential(
+            nn.Linear(obs_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x):
+        return self.policy(x), self.value(x)
+
+class ReinforceAgent():
+    def __init__(self,mode='sim'):
+        self.count = 0
+        self.mode = mode
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.get_goal = False
+        self.goal_x = 0
+        self.goal_y = 0
+        self.y0=self.y1=self.y2=self.y3=self.y4=None
+        self.position = None
+        self.heading = 0
+        if self.mode == 'sim':
+            self.sub_odom = rospy.Subscriber('gazebo/model_states', ModelStates, self.getOdometry)
+        else:
+            self.sub_pose = rospy.Subscriber('mocap_pose_topic/go1_pose', PoseStamped, self.getrobot,queue_size=1)
+            self.sub_frisbee = rospy.Subscriber('mocap_pose_topic/frisbee1_pose', PoseStamped, self.getfrisbee,queue_size=1)
+            # self.sub_impact_point = rospy.Subscriber('NAE/impact_point', PoseStamped, self.getimpactpoint)
+            # self.sub_danger_zone = rospy.Subscriber('NAE/danger_zone', UInt8, self.getdangerzone,queue_size=1)
+        self.reset_proxy = rospy.ServiceProxy('gazebo/reset_simulation', Empty)
+        self.reset_proxy2 = rospy.ServiceProxy('gazebo/reset_world', Empty)
+        self.unpause_proxy = rospy.ServiceProxy('gazebo/unpause_physics', Empty)
+        self.pause_proxy = rospy.ServiceProxy('gazebo/pause_physics', Empty)
+
+        self.net = PPOModel(obs_size=2, n_actions=2).to(device=self.device)
+        optimizer = optim.Adam(self.net.parameters(), lr=3e-4)
+        self.model = PPO(
+                model=self.net,
+                optimizer=optimizer,
+                gpu=(0 if str(self.device)=="cuda" else -1),  # -1でGPUを使わない設定
+                gamma=0.99,  # 割引率
+                lambd=0.95,  # GAE (Generalized Advantage Estimation) のパラメータ
+                entropy_coef=0.01,  # エントロピー正則化の係数
+                update_interval=2048,  # エージェントがネットワークを更新する間隔
+                minibatch_size=64,  # ミニバッチのサイズ
+                epochs=10,  # ポリシーを更新するエポック数
+                clip_eps=0.2,  # PPOでクリッピングを行う範囲
+                standardize_advantages=True,  # アドバンテージを標準化
+            )
+        
+        if self.mode != 'sim':
+                HIGHLEVEL = 0xee
+                LOWLEVEL  = 0xff
+
+                self.udp = sdk.UDP(HIGHLEVEL, 8080, "192.168.50.128", 8082)
+
+                self.cmd = sdk.HighCmd()
+                self.state = sdk.HighState()
+                self.udp.InitCmdData(self.cmd)
+
+
+    def getGoalDistace(self):
+        goal_distance = round(math.hypot(self.goal_x - self.position.x, self.goal_y - self.position.y), 2)
+        return goal_distance
+
+    def getOdometry(self, odom):
+        self.position = odom.pose[2].position
+        orientation = odom.pose[2].orientation
+        orientation_list = [orientation.x, orientation.y, orientation.z, orientation.w]
+        self.roll, _, yaw = euler_from_quaternion(orientation_list)
+
+        goal_angle = math.atan2(self.goal_y - self.position.y, self.goal_x - self.position.x)
+
+        heading = goal_angle - yaw
+        if heading > pi:
+            heading -= 2 * pi
+
+        elif heading < -pi:
+            heading += 2 * pi
+
+        self.heading = round(heading, 2)
+
+    def getrobot(self,data):
+        self.position = data.pose.position
+        self.position.y = -self.position.z
+        self.position.x = self.position.x -3.75
+        orientation = data.pose.orientation
+        orientation_list = [orientation.x, -orientation.z, orientation.y, orientation.w]
+        self.roll, _, yaw = euler_from_quaternion(orientation_list)
+
+        goal_angle = math.atan2(self.goal_y - self.position.y, self.goal_x - self.position.x)
+
+        heading = goal_angle - yaw
+        if heading > pi:
+            heading -= 2 * pi
+
+        elif heading < -pi:
+            heading += 2 * pi
+
+        self.heading = round(heading, 2)
+
+    def getfrisbee(self,data):
+        self.goal_position = data.pose.position
+        self.goal_position.y = -self.goal_position.z
+        self.goal_position.x = self.goal_position.x
+        
+        if self.get_goal == False:
+            ###########linear#####################
+            # if self.goal_position.x > 0.5:
+            #     self.count += 1
+            #     print(f'\n\n==============  Trial {self.count}  ==============')
+            #     print('cross')
+            #     self.goal_x = 0.0
+            #     if self.goal_position.y > -0.85:##0.83 in lab
+            #         print('\nGOAL: LEFT')
+            #         self.goal_y = -0.6
+            #     else:
+            #         print('\nGOAL: RIGHT')
+            #         self.goal_y = 0.6
+            #     print('     goal:       x=',  self.goal_x, ' y=',  self.goal_y)
+            #     print('     frisbee:    x=', self.goal_position.x, ' y=', self.goal_position.y)
+            #     self.get_goal = True
+            ########################################
+
+            ############random######################
+            # self.goal_x = 0.0
+            # n = round(random.uniform(-0.5, 0.5), 1)
+            # if n < 0:
+            #     self.goal_y = -0.5
+            # else:
+            #     self.goal_y = 0.5
+
+            # self.get_goal = True
+            #########################################
+
+            ############bezier#######################
+            # x0 = -1.5
+            x1 = -1.5
+            x2 = -1.0
+            x3 = -0.5
+            # x4 = 0.5
+            # if (self.y4 == None) and (self.goal_position.x > 0.5):
+            #     self.y4 = self.goal_position.y
+            #     print(self.goal_position.x)
+            #     print(self.y4)
+            if (self.y3 == None) and (self.goal_position.x > x3):
+                self.y3 = self.goal_position.y
+                # print(self.goal_position.x)
+                # print(self.y3)
+            elif (self.y2 == None) and (self.goal_position.x > x2):
+                self.y2 = self.goal_position.y
+                # print(self.goal_position.x)
+                # print(self.y2)
+            elif (self.y1 == None) and (self.goal_position.x > x1):
+                self.y1 = self.goal_position.y
+                # print(self.goal_position.x)
+                # print(self.y1)
+            # elif self.goal_position.x > -1.5:
+            #     self.y0 = self.position.y
+
+            if  self.y1 and self.y2 and self.y3:
+                nodes = np.array([
+                    [x1, x2, x3],
+                    [self.y1, self.y2, self.y3]
+                ])
+
+                curve = bezier.Curve(nodes, degree=2)
+
+                points = curve.evaluate_multi(np.linspace(-2, 4, 100))
+
+                x_values = points[0, :]
+                y_values = points[1, :]
+                y_at_x1 = y_values[np.argmin(np.abs(x_values - 3.75))]
+                self.goal_x = 0.0
+                if y_at_x1 > 0:
+                    self.goal_y = -0.6
+                else:
+                    self.goal_y = 0.6
+
+                self.get_goal = True
+                self.y0=self.y1=self.y2=self.y3=self.y4=None
+                ########################################
+
+    def getdangerzone(self,data):
+        ##########4point#######################
+        # if data.data == 1:
+        #         self.goal_x = 0.5
+        #         self.goal_y = -0.5
+        # elif data.data == 2:
+        #         self.goal_x = 0.5
+        #         self.goal_y = 0.5
+        # elif data.data == 3:
+        #         self.goal_x = -0.5
+        #         self.goal_y = 0.5
+        # elif data.data == 4:
+        #         self.goal_x = -0.5
+        #         self.goal_y = -0.5
+        # else:
+        #     self.goal_x = self.position.x
+        #     self.goal_y = self.position.y      
+        #########################################
+
+        ############2point#####################
+        if data.data == 1 or data.data == 4:
+            self.goal_x = 0.0
+            self.goal_y = -0.6
+            self.get_goal = True
+        elif data.data == 2 or data.data == 3:
+            self.goal_x = 0.0
+            self.goal_y = 0.6
+            self.get_goal = True
+        else:
+            self.goal_x = self.position.x
+            self.goal_y = self.position.y
+        ########################################
+    
+    def getgoal(self,data):
+        self.goal_position = data.pose.position
+        self.goal_position.y = -self.goal_position.z
+        self.goal_position.x = self.goal_position.x -2.5
+
+        self.goal_x = self.goal_position.x
+        self.goal_y = self.goal_position.y
+
+    def Reward(self,goal,collision): #毎ステップ呼び出し
+        goal_distance = self.getGoalDistace() #ゴールまでの距離を取得
+        score = -(goal_distance**2) #距離の2乗を引く（初期値）
+        if goal: #ゴールしたとき
+            score += 10000
+        if collision:#衝突（仮）
+            score -= 1000
+        return score
+
+    def step(self, action, goal_distance):
+        done = False
+        goal = False
+        collision = False
+
+        if self.get_goal:
+            goal_margin = 0.2
+        else:
+            goal_margin = 0.1
+
+        if abs(self.position.x)>0.35 or abs(self.position.y)>0.9:
+            print(self.position.x,self.position.y)
+            done = True
+            collision = True
+
+        elif goal_distance <goal_margin:
+            done = True
+            goal = True
+            if self.mode == 'sim':
+                vel_cmd = Twist()
+                vel_cmd.linear.x = 0.0 #直進方向m/s
+                vel_cmd.linear.y = 0.0
+                vel_cmd.angular.z =0.0  #回転方向 rad/s
+                self.pub_cmd_vel.publish(vel_cmd) #実行
+                time.sleep(2)
+                self.goal_x, self.goal_y = self.respawn_goal.getPosition(True,delete=True)
+            else:
+                if self.get_goal:
+                    steptime = time.time()
+                    now=time.time()
+                    while now - steptime <=0.5:
+                        self.udp.Recv()
+                        self.udp.GetRecv(self.state)
+                        self.cmd.mode = 0      # 0:idle, default stand      1:forced stand     2:walk continuously
+                        self.cmd.gaitType = 0
+                        self.cmd.speedLevel = 0
+                        self.cmd.footRaiseHeight = 0
+                        self.cmd.bodyHeight = 0
+                        self.cmd.euler = [0, 0, 0]
+                        self.cmd.velocity = [0, 0]
+                        self.cmd.yawSpeed = 0.0
+                        self.cmd.reserve = 0
+
+                        self.cmd.mode = 1
+                        self.cmd.gaitType = 1
+                        self.cmd.velocity = [0.0, 0.0] # -1  ~ +1
+                        self.cmd.bodyHeight = 0.1
+
+                        self.udp.SetSend(self.cmd)
+                        self.udp.Send()
+                        now = time.time()
+
+        else:
+            if self.mode == 'sim':
+                self.pub_cmd_vel = rospy.Publisher('cmd_vel', Twist, queue_size=5)
+                rate = rospy.Rate(50)
+                vel_cmd = Twist()#steptime:0.2s
+                vel_cmd.linear.x = action[0] #直進方向 m/s
+                vel_cmd.linear.y = action[1]
+                # vel_cmd.angular.z = action[2] #回転方向 rad/s
+                self.pub_cmd_vel.publish(vel_cmd) #実行
+                rate.sleep()
+            else:
+                self.udp.Recv()
+                self.udp.GetRecv(self.state)
+                self.cmd.mode = 0      # 0:idle, default stand      1:forced stand     2:walk continuously
+                self.cmd.gaitType = 0
+                self.cmd.speedLevel = 0
+                self.cmd.footRaiseHeight = 0
+                self.cmd.bodyHeight = 0
+                self.cmd.euler = [0, 0, 0]
+                self.cmd.velocity = [0, 0]
+                self.cmd.yawSpeed = 0.0
+                self.cmd.reserve = 0
+
+                action_scale = 1
+                steptime = time.time()
+                now=time.time()
+                while now - steptime <=0.01: ## 0.1 or somevalue 
+                    self.cmd.mode = 2
+                    self.cmd.gaitType = 2 ## 1:walking 2:run
+                    self.cmd.velocity = [action[0]*action_scale, action[1]*action_scale] # -1  ~ +1
+                    self.cmd.bodyHeight = 0.1
+
+                    self.udp.SetSend(self.cmd)
+                    self.udp.Send()
+                    now = time.time()
+
+        reward = self.Reward(goal,collision)
+
+        return reward, done, goal, collision
+
+    def play(self,Set=0):
+        self.model.load(os.path.dirname(os.path.realpath(__file__))+'/'+'75000')
+        if self.mode == 'sim':
+            self.respawn_goal = Respawn()
+            self.goal_x, self.goal_y = self.respawn_goal.getPosition()
+
+        goal_distance = self.getGoalDistace()
+        command = [goal_distance,self.heading]
+        state = np.asarray(command)
+        state = torch.from_numpy(state).float().to(device=self.device)
+        start_time = time.time()
+        goal = False
+        collision = False
+        reward = 0
+        goals = 0
+        collisions = 0
+        score = 0
+        self.create_csv=True
+        self.first_move = 0
+
+        with self.model.eval_mode():
+            a = time.time()
+            while not rospy.is_shutdown():
+                b = time.time()
+                # print(b-a)
+                a = time.time()
+                action = self.model.act(state)
+                if self.get_goal == False:
+                    # self.goal_x = 0
+                    # self.goal_y = round(random.uniform(-0.1, 0.1), 1)
+                    # # self.goal_y = 0
+                    # action = np.clip(action, -0.1, 0.1)
+                    pass
+                else:
+                    action = np.clip(action, -0.5, 0.5) #0.50.5
+                    if self.first_move < 5:
+                        if self.goal_y >0:
+                            action = [0.0,-2]
+                        else:
+                            action = [0.0,2]
+                        self.first_move += 1
+
+                    goal_distance = self.getGoalDistace()
+                    reward, done, goal, collision= self.step(action,goal_distance)
+
+                    if goal:
+                        goals += 1
+
+                    if collision:
+                        collisions += 1
+
+                    score += reward
+                    if collision:
+                        if self.mode == 'sim':
+                            vel_cmd = Twist()
+                            vel_cmd.linear.x = 0.0 #直進方向m/s
+                            vel_cmd.linear.y = 0.0
+                            vel_cmd.angular.z =0.0  #回転方向 rad/s
+                            self.pub_cmd_vel.publish(vel_cmd) #実行
+
+                            state_msg = ModelState()
+                            state_msg.model_name = 'go1_gazebo'
+                            state_msg.pose.position.x = 0.0
+                            state_msg.pose.position.y = 0.0
+                            state_msg.pose.position.z = self.position.z
+                            q=quaternion_from_euler(0,0,0)
+                            state_msg.pose.orientation.x = q[0]
+                            state_msg.pose.orientation.y = q[1]
+                            state_msg.pose.orientation.z = q[2]
+                            state_msg.pose.orientation.w = q[3]
+                            rospy.wait_for_service('/gazebo/set_model_state')
+                            set_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+                            set_state( state_msg )
+                        else:
+                            start = time.time()
+                            now = time.time()
+                            while now-start<0.5:
+                                self.udp.Recv()
+                                self.udp.GetRecv(self.state)
+                                self.cmd.mode = 0      # 0:idle, default stand      1:forced stand     2:walk continuously
+                                self.cmd.gaitType = 0
+                                self.cmd.speedLevel = 0
+                                self.cmd.footRaiseHeight = 0
+                                self.cmd.bodyHeight = 0
+                                self.cmd.euler = [0, 0, 0]
+                                self.cmd.velocity = [0, 0]
+                                self.cmd.yawSpeed = 0.0
+                                self.cmd.reserve = 0
+
+                                self.cmd.mode = 1
+                                self.cmd.gaitType = 1
+                                self.cmd.velocity = [0.0, 0.0] # -1  ~ +1
+                                self.cmd.bodyHeight = 0.1
+
+                                self.udp.SetSend(self.cmd)
+                                self.udp.Send()
+                                now = time.time()
+
+                            while not rospy.is_shutdown():
+                                self.yn = input("safety! move the robot and press 'y' & enter: ")
+                                if self.yn == 'y':
+                                    break
+                            self.get_goal = False
+                            self.first_move = 0
+
+                    elif self.get_goal and goal:
+                        start = time.time()
+                        now = time.time()
+                        while now-start<0.5:
+                            self.udp.Recv()
+                            self.udp.GetRecv(self.state)
+                            self.cmd.mode = 0      # 0:idle, default stand      1:forced stand     2:walk continuously
+                            self.cmd.gaitType = 0
+                            self.cmd.speedLevel = 0
+                            self.cmd.footRaiseHeight = 0
+                            self.cmd.bodyHeight = 0
+                            self.cmd.euler = [0, 0, 0]
+                            self.cmd.velocity = [0, 0]
+                            self.cmd.yawSpeed = 0.0
+                            self.cmd.reserve = 0
+
+                            self.cmd.mode = 1
+                            self.cmd.gaitType = 1
+                            self.cmd.velocity = [0.0, 0.0] # -1  ~ +1
+                            self.cmd.bodyHeight = 0.1
+
+                            self.udp.SetSend(self.cmd)
+                            self.udp.Send()
+                            now = time.time()
+
+                        while not rospy.is_shutdown():
+                            self.yn = input("collect the frisbee and press 'y' & enter: ")
+                            if self.yn == 'y':
+                                    break
+                        self.get_goal = False
+                        self.first_move = 0
+                    command = [goal_distance,self.heading]
+                    next_state = np.asarray(command)
+                    next_state = torch.from_numpy(next_state).float().to(device=self.device)
+                    state = next_state
+            print('play finish')
+
+if __name__ == '__main__':
+    rospy.init_node('go1_pbl_real')
+    while not rospy.is_shutdown():
+        agent = ReinforceAgent(mode='real')
+        agent.play()
