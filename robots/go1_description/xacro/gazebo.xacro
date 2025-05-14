@@ -382,4 +382,16 @@
         <kd  value="1.0"/>
     </gazebo>
 
+    <gazebo>
+        <plugin name="gazebo_ros_p3d" filename="libgazebo_ros_p3d.so">
+            <robotNamespace>/unitree_go1</robotNamespace>
+            <alwaysOn>true</alwaysOn>
+            <bodyName>base</bodyName>  <!-- Frame gốc của robot -->
+            <topicName>/unitree_go1/pose</topicName>
+            <frameName>world</frameName>
+            <updateRate>100</updateRate>  <!-- Cập nhật 100Hz -->
+            <gaussianNoise>0.0</gaussianNoise>
+        </plugin>
+    </gazebo>
+
 </robot>
